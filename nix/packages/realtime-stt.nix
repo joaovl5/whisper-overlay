@@ -22,6 +22,9 @@ buildPythonPackage rec {
     hash = "sha256-64RE/aT5PxuFFUTvjNefqTlAKWG1fftKV0wcY/hFlcg=";
   };
 
+  pyproject = true;
+  build-system = [setuptools];
+
   nativeBuildInputs = [
     setuptools
     wheel
