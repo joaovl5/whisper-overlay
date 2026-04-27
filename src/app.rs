@@ -1,4 +1,4 @@
-use color_eyre::eyre::{bail, Context, Result};
+use color_eyre::eyre::{bail, Context, ContextCompat, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use futures_util::StreamExt;
 use gdk::glib::ExitCode;
@@ -47,6 +47,7 @@ pub enum ConnectionState {
 #[derive(Debug, Deserialize)]
 pub struct Word {
     #[allow(unused)]
+    #[serde(alias = "start")]
     begin: f32,
     #[allow(unused)]
     end: f32,
@@ -92,10 +93,71 @@ async fn set_disconnect_status(ui_sender: &mpsc::Sender<UiAction>, message: &ser
         .unwrap();
 }
 
+fn is_final_result_message(message: &serde_json::Value) -> bool {
+    message.get("segments").is_some() && message.get("kind") == Some(&json!("result"))
+}
+
+fn input_device_names(host: &cpal::Host) -> Result<Vec<String>> {
+    let devices = host
+        .input_devices()
+        .wrap_err("Failed to enumerate input devices")?;
+
+    Ok(devices
+        .map(|device| device.name().unwrap_or_else(|_| "<unknown>".to_string()))
+        .collect())
+}
+
+fn select_input_device(host: &cpal::Host, requested_name: Option<&str>) -> Result<cpal::Device> {
+    if let Some(requested_name) = requested_name {
+        let devices = host
+            .input_devices()
+            .wrap_err("Failed to enumerate input devices")?;
+
+        for device in devices {
+            let name = device.name().unwrap_or_else(|_| "<unknown>".to_string());
+            if name == requested_name {
+                return Ok(device);
+            }
+        }
+
+        let names = input_device_names(host)?;
+        let available = if names.is_empty() {
+            "  <none>".to_string()
+        } else {
+            names
+                .into_iter()
+                .map(|name| format!("  {name}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        bail!("Input device {requested_name:?} not found. Available input devices:\n{available}");
+    }
+
+    host.default_input_device()
+        .context("No input device available")
+}
+
+fn print_input_devices() -> Result<()> {
+    let host = cpal::default_host();
+    let names = input_device_names(&host)?;
+
+    if names.is_empty() {
+        println!("No input devices found");
+    } else {
+        for name in names {
+            println!("{name}");
+        }
+    }
+
+    Ok(())
+}
+
 async fn handle_connection(
     mut connection_receiver: watch::Receiver<ConnectionState>,
     ui_sender: mpsc::Sender<UiAction>,
     connection_opts: ConnectionOpts,
+    input_device: Option<String>,
 ) {
     ui_sender.send(UiAction::Disconnected(None)).await.unwrap();
 
@@ -106,14 +168,24 @@ async fn handle_connection(
     let audio_active = Arc::new(Mutex::new(false));
     let audio_active_2 = audio_active.clone();
 
+    let host = cpal::default_host();
+    let device = match select_input_device(&host, input_device.as_deref()) {
+        Ok(device) => device,
+        Err(e) => {
+            eprintln!("Failed to select input device: {e:#}");
+            ui_sender
+                .send(UiAction::Disconnected(Some(e.to_string())))
+                .await
+                .unwrap();
+            return;
+        }
+    };
+    println!(
+        "Input device: {}",
+        device.name().unwrap_or_else(|_| "<unknown>".to_string())
+    );
+
     let audio_thread = std::thread::spawn(move || {
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .expect("No input device available");
-
-        println!("Input device: {}", device.name().unwrap());
-
         let config = cpal::StreamConfig {
             channels: 1,
             sample_rate: cpal::SampleRate(16000),
@@ -245,7 +317,7 @@ async fn handle_connection(
                         match message {
                             Ok(message) => {
                                 if message.get("segments").is_some() {
-                                    if message.get("kind") != Some(&json!("result")) {
+                                    if is_final_result_message(&message) {
                                         // If this is a result message, and we have a running shutdown timer
                                         // (i.e. we want to disconnect), we use this as the final result.
                                         if let Some(ref timer) = shutdown_timer {
@@ -370,13 +442,21 @@ async fn handle_hotkey(
 }
 
 pub fn launch_app(opts: Command) -> Result<()> {
-    // Create a new application
-    let app = Application::builder().application_id(APP_ID).build();
-
-    let Command::Overlay { style, .. } = opts.clone() else {
+    let Command::Overlay {
+        style,
+        list_input_devices,
+        ..
+    } = opts.clone()
+    else {
         bail!("got invalid command options");
     };
 
+    if list_input_devices {
+        return print_input_devices();
+    }
+
+    // Create a new application
+    let app = Application::builder().application_id(APP_ID).build();
     // Connect to signals
     app.connect_startup(move |_| load_css(style.clone()));
     app.connect_activate(move |app| build_ui(app, opts.clone()));
@@ -411,6 +491,7 @@ fn build_ui(app: &Application, opts: Command) {
     let Command::Overlay {
         connection_opts,
         hotkey,
+        input_device,
         ..
     } = opts
     else {
@@ -488,7 +569,7 @@ fn build_ui(app: &Application, opts: Command) {
     // Spawn connection manager
     runtime().spawn(
         glib::clone!(@strong connection_receiver, @strong ui_sender => async move {
-            handle_connection(connection_receiver, ui_sender, connection_opts.clone()).await;
+            handle_connection(connection_receiver, ui_sender, connection_opts.clone(), input_device.clone()).await;
         }),
     );
 
@@ -623,4 +704,42 @@ fn build_ui(app: &Application, opts: Command) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn model_result_accepts_faster_whisper_start_field() {
+        let result: ModelResult = serde_json::from_value(json!({
+            "kind": "realtime",
+            "text": "hello",
+            "segments": [{
+                "words": [{
+                    "start": 0.25,
+                    "end": 0.75,
+                    "word": "hello",
+                    "probability": 0.9
+                }]
+            }]
+        }))
+        .expect("model result with faster-whisper word timing should deserialize");
+
+        assert_eq!(result.segments[0].words[0].begin, 0.25);
+    }
+
+    #[test]
+    fn final_result_message_is_detected_for_flush_shutdown() {
+        assert!(is_final_result_message(&json!({
+            "kind": "result",
+            "segments": []
+        })));
+
+        assert!(!is_final_result_message(&json!({
+            "kind": "realtime",
+            "segments": []
+        })));
+    }
 }
